@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for DYLD_FALLBACK_LIBRARY_PATH to be honored by a
+         hardened-runtime signed binary on macOS 26.  gps_wrapper sets this
+         env var to steer dyld to the bundled dylibs; without this entitlement
+         macOS strips DYLD_* environment variables at Launch Services spawn. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- Allow loading of non-system dylibs that aren't signed with the same
+         Team ID as the main binary.  Our bundled Homebrew-derived dylibs
+         (libglib, libgtk, libpython, librsvg, ...) are ad-hoc signed, not
+         signed with our Developer ID; library validation would refuse to
+         load them under hardened runtime without this. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Python's ctypes, and libadalang's bindings via Python, allocate
+         executable memory pages for trampolines.  Hardened runtime blocks
+         this by default. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- GNAT runtime's stack-unwinder walks JIT'd frames from libffi; give
+         it permission to allocate RWX pages via mmap. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>

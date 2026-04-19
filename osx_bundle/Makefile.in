@@ -1,12 +1,23 @@
 PREFIX:=$(PWD)
 TOP:=$(PWD)
 GTK_PREFIX=@GTK_PREFIX@
+# Libraries/binaries from glib, gdk-pixbuf, gobject-introspection live here,
+# not under the gtk+3 cellar path.
+HOMEBREW_PREFIX=$(shell brew --prefix)
 GPS_VERSION=@GPS_VERSION@
 GPS_VERSION_NUM=$(shell echo $(GPS_VERSION) | sed -e 's/\([0-9.]*\).*/\1/')
 
-APP:=GPS.app
-PKG:=GPS-$(GPS_VERSION).pkg
-DMG:=GPS-$(GPS_VERSION).dmg
+APP_NAME:=GNAT Studio
+APP:=$(APP_NAME).app
+DMG:=GNATStudio-$(GPS_VERSION).dmg
+
+# Detect the Python 3 runtime (stdlib and headers) via python3 itself.
+PYTHON_LIB_DIR:=$(shell python3 -c "import sysconfig; print(sysconfig.get_path('stdlib'))" 2>/dev/null)
+PYTHON_INC_DIR:=$(shell python3 -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null)
+# Version directory name, e.g. "python3.14" — matches the basename of PYTHON_LIB_DIR
+# (which Homebrew lays out as .../python3.14/).  Used to build $(lib)/$(PYTHON_VER)/
+# paths for site-packages, lib-dynload, etc.
+PYTHON_VER:=$(notdir $(PYTHON_LIB_DIR))
 
 contents=$(TOP)/_build/Applications/$(APP)/Contents
 root=$(contents)/MacOS
@@ -16,99 +27,225 @@ lib=$(root)/lib
 share=$(root)/share
 inc=$(root)/include
 
-all: pkg
+CLI_PREFIX?=/usr/local
 
-pkg: $(PREFIX)/$(PKG)
+all: dmg
 
 dmg: $(PREFIX)/$(DMG)
 
+app: _build/Applications/.staged
+
 clean:
-	rm -rf *.dmg GPS.app
+	rm -rf _build *.dmg
 
-.PHONY: force
+.PHONY: all dmg app clean force install-cli sign notarize
 
-$(PREFIX)/$(DMG): $(PREFIX)/$(PKG)
-# create dmg image
-	cd $(PREFIX) && \
-	  sh $(TOP)/scripts/dodmg.sh GPS $(GPS_VERSION) $(TOP)
-	rm -f $(PREFIX)/$(PKG)
+$(PREFIX)/$(DMG): _build/Applications/.staged
+	sh "$(TOP)/scripts/dodmg.sh" "$(APP_NAME)" "$(GPS_VERSION)" "$(TOP)" \
+	    "$(TOP)/_build/Applications/$(APP)" "$(PREFIX)/$(DMG)"
 
-$(PREFIX)/$(PKG): force
+_build/Applications/.staged: force
 	rm -rf _build
 
 # prepare the OSX Application structure
-	mkdir -p $(contents)
-	mkdir -p $(root)
-	mkdir -p $(lib)
-	mkdir -p $(inc)
-	mkdir -p $(etc)
-	cp -r Resources $(contents)
-	cp srcs/Info.plist $(contents)
-	cp srcs/gps_bundle_main $(root)/gps
+	mkdir -p "$(contents)"
+	mkdir -p "$(root)"
+	mkdir -p "$(lib)"
+	mkdir -p "$(inc)"
+	mkdir -p "$(etc)"
+	mkdir -p "$(bin)"
+	cp -r Resources "$(contents)"
+	sed -e 's/__GPS_VERSION__/$(GPS_VERSION_NUM)/' srcs/Info.plist > "$(contents)/Info.plist"
+	cp srcs/gps_bundle_main "$(root)/gnatstudio"
+	chmod a+x "$(root)/gnatstudio"
 
-# install gps
-	make -C .. install-strip prefix=$(root)
-	find $(contents) -d -name .svn -exec rm -rf {} \;
+# install GNAT Studio itself. The darwin branch of the top-level install-strip
+# rule places:
+#   $(bin)/gnatstudio_exe  -- the real Ada binary (scanned by install.py)
+#   $(bin)/gnatstudio      -- distrib/gps_wrapper, the runtime env shim
+#   $(bin)/gnatdoc3        -- doc generator
+#   $(bin)/gnatstudio_cli  -- headless cli frontend (Ada binary)
+	$(MAKE) -C .. install-strip prefix="$(root)"
+
+# Bundle Ada @rpath dylibs. gprbuild embeds Alire-cache paths as LC_RPATH
+# in the Ada binaries. Collect them from the source-tree binaries (which
+# still have correct @executable_path rpaths), copy to lib/, then rewrite
+# every "@rpath/libfoo.dylib" reference in the installed binaries to the
+# bare name "libfoo.dylib" so DYLD_FALLBACK_LIBRARY_PATH ($root/lib) finds them.
+	python3 ./scripts/copy_rpath_deps.py "$(lib)" \
+	  --source "$(TOP)/../gnatstudio/obj/gnatstudio" \
+	           "$(TOP)/../cli/obj/gnatdoc3" \
+	           "$(TOP)/../cli/obj/gnatstudio_cli" \
+	  --patch  "$(bin)/gnatstudio_exe" \
+	           "$(bin)/gnatdoc3" \
+	           "$(bin)/gnatstudio_cli"
 
 # install gtk data files
-	cp -r $(GTK_PREFIX)/lib/girepository-1.0 $(lib)
-	cp -r $(GTK_PREFIX)/lib/gio $(lib)
-	cp -r $(GTK_PREFIX)/lib/gdk-pixbuf-2.0 $(lib)
-	cp -r $(GTK_PREFIX)/lib/gtk-3.0 $(lib)
-	rm $(lib)/gdk-pixbuf-2.0/*/loaders.cache
-	mkdir -p $(etc)/gtk-3.0
-	cp srcs/settings.ini $(etc)/gtk-3.0/
-	-cp -r $(GTK_PREFIX)/etc/pango $(etc)
+# Use HOMEBREW_PREFIX (not GTK_PREFIX's Cellar) so we pick up typelibs from
+# every linked Homebrew package — GTK_PREFIX/lib/girepository-1.0 only
+# contains gtk+3's own typelibs (Gdk-3.0, Gtk-3.0), while GLib, GObject, Gio,
+# cairo, Pango, GdkPixbuf, Atk, Atspi, etc. live under HOMEBREW_PREFIX.
+# Without the full set, PyGObject's _gi crashes in pygi_arg_interface_new_from_info
+# doing strcmp(NULL, ...) whenever a callable signature references a type from
+# a missing typelib.  -L dereferences symlinks into Cellar paths that would
+# otherwise dangle once the bundle is moved to /Applications.
+	cp -rL $(HOMEBREW_PREFIX)/lib/girepository-1.0 "$(lib)"
+# -rL: dereference symlinks (gio/modules/libgiognutls.so is a relative
+# symlink into Homebrew's cellar that would break once copied into the bundle).
+	cp -rL $(HOMEBREW_PREFIX)/lib/gio "$(lib)"
+	cp -rL $(HOMEBREW_PREFIX)/lib/gdk-pixbuf-2.0 "$(lib)"
+	cp -r $(GTK_PREFIX)/lib/gtk-3.0 "$(lib)"
+	rm -f "$(lib)"/gdk-pixbuf-2.0/*/loaders.cache
+# Rewrite GTK immodules.cache absolute paths from Homebrew to bundle-relative.
+# The cache ships with /opt/homebrew/Cellar/gtk+3/<ver>/... paths baked in;
+# at GTK init time those would dlopen the Homebrew GTK stack alongside ours,
+# duplicating libgtk/libgdk/libgio ObjC classes and corrupting GObject types.
+	find "$(lib)/gtk-3.0" -name 'immodules.cache' -exec sed -i '' \
+	  -e 's|/opt/homebrew/Cellar/gtk+3/[^/]*|$(root)|g' {} \;
+	mkdir -p "$(etc)/gtk-3.0"
+	cp srcs/settings.ini "$(etc)/gtk-3.0/"
+	-cp -r $(GTK_PREFIX)/etc/pango "$(etc)"
 
-# install gtk binaries and libraries
-	python ./scripts/install.py $(root) \
-	  $(GTK_PREFIX)/bin/gdk-pixbuf-query-loaders \
-	  $(bin)/gps_exe \
-	  $(lib)/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
-	  $(GTK_PREFIX)/lib/libgirepository*.dylib \
-	  $(GTK_PREFIX)/lib/libpyglib*.dylib
+# install python 3 run-time (standard library + headers) BEFORE install.py,
+# so install.py can walk lib-dynload/*.so and pull their Homebrew-absolute
+# deps (libssl, libcrypto, libsqlite3, libmpdec, libncurses) into the bundle.
+	@if [ -n "$(PYTHON_LIB_DIR)" ]; then \
+	  echo "Copying $(PYTHON_LIB_DIR) -> $(lib)"; \
+	  cp -r "$(PYTHON_LIB_DIR)" "$(lib)/"; \
+	else \
+	  echo "Warning: no python3 runtime found under $(GTK_PREFIX)/lib"; \
+	fi
+	@if [ -n "$(PYTHON_INC_DIR)" ]; then \
+	  cp -r "$(PYTHON_INC_DIR)" "$(inc)/"; \
+	fi
 
-# install python run-time
-	cp -r $(GTK_PREFIX)/lib/python2.7 $(lib)
-	cp -r $(GTK_PREFIX)/include/python2.7 $(inc)
+# Copy PyGObject (gi) into the bundled site-packages.  Without this the
+# embedded Python falls back to Homebrew's site-packages, whose _gi.so has
+# absolute Homebrew deps that duplicate libglib/libgobject in-process.
+# The Python stdlib copy above preserves Homebrew's site-packages symlink
+# pointing back out of the bundle — nuke it and make a real directory here.
+# -RL: recursive + dereference symlinks so the copy survives relocation.
+	rm -rf "$(lib)/$(PYTHON_VER)/site-packages"
+	mkdir -p "$(lib)/$(PYTHON_VER)/site-packages"
+	cp -RL $(HOMEBREW_PREFIX)/lib/$(PYTHON_VER)/site-packages/gi \
+	       "$(lib)/$(PYTHON_VER)/site-packages/"
 
-# cleanup and strip libraries and python run-time
-	find $(lib) -name \*.dylib -exec strip -S - {} \;
-	find $(lib) -name \*.py[co] -exec rm {} \;
-	find $(lib) -name \*.la -exec rm {} \;
+# Copy libadalang's Python ctypes binding (single __init__.py that dlopens
+# libadalang.dylib).  Required by GPS plug-ins via "import libadalang".
+# Search order: Alire cache (if live), vendored snapshot in the repo.
+# osx_bundle/vendored/libadalang-python/ is a checked-in copy for
+# reproducible builds when the Alire workspace at /tmp/gnatstudio-env is
+# gone — the libadalang binding is tiny (one __init__.py + py.typed).
+	@LAL_PY=$$(ls -d \
+	  /tmp/gnatstudio-env/alire/cache/dependencies/libadalang_*/python/libadalang \
+	  $(TOP)/../.tools/alire/cache/dependencies/libadalang_*/python/libadalang \
+	  $(TOP)/vendored/libadalang-python/libadalang \
+	  2>/dev/null | head -1); \
+	if [ -n "$$LAL_PY" ]; then \
+	  echo "Copying $$LAL_PY -> $(lib)/$(PYTHON_VER)/site-packages/"; \
+	  cp -RL "$$LAL_PY" "$(lib)/$(PYTHON_VER)/site-packages/"; \
+	else \
+	  echo "ERROR: libadalang Python binding not found (searched Alire cache + osx_bundle/vendored/)"; exit 1; \
+	fi
+
+# Rename the svg pixbuf loader so gdk-pixbuf-query-loaders picks it up when
+# scanning the directory: it only matches libpixbufloader-*.so (dash), but
+# librsvg ships it as libpixbufloader_svg.so (underscore).  Drop the .dylib
+# duplicate that would confuse the scanner.
+	@if [ -f "$(lib)/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so" ]; then \
+	  mv "$(lib)/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so" \
+	     "$(lib)/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so"; \
+	  rm -f "$(lib)/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.dylib"; \
+	fi
+
+# install gtk binaries and libraries, rewriting install names.
+# install.py walks every Mach-O listed here recursively (via resolver.py's
+# transitive dep resolution) and rewrites install names to bare filenames:
+#   * Python C extensions (lib-dynload/*.so) pull libssl/libcrypto/libmpdec/
+#     libsqlite3 into the bundle and unlink them from Homebrew.
+#   * PyGObject _gi.so + overrides pull libgirepository-2.0 + any gstreamer
+#     bits referenced by the override modules.
+#   * GIO modules (libgiognutls.so) pull libgnutls + libtasn1 + nettle.
+#   * The renamed libpixbufloader-svg.so pulls librsvg-2.2 and its deps.
+# gtk-query-immodules-3.0 and gdk-pixbuf-query-loaders are included so they
+# can run from the bundle at startup (gps_wrapper regens the caches).
+	python3 ./scripts/install.py "$(root)" \
+	  $(HOMEBREW_PREFIX)/bin/gdk-pixbuf-query-loaders \
+	  $(HOMEBREW_PREFIX)/bin/gtk-query-immodules-3.0 \
+	  "$(bin)/gnatstudio_exe" \
+	  "$(bin)/gnatdoc3" \
+	  "$(bin)/gnatstudio_cli" \
+	  "$(lib)"/gdk-pixbuf-2.0/*/loaders/*.so \
+	  "$(lib)"/gio/modules/*.so \
+	  "$(lib)"/$(PYTHON_VER)/lib-dynload/*.so \
+	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/*.so \
+	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/overrides/*.so \
+	  $(HOMEBREW_PREFIX)/lib/libgirepository*.dylib
+
+# Final fixup: rewrite ALL remaining absolute-path deps to bare names.
+# install.py only processes files on its command line, so Ada dylibs (from
+# copy_rpath_deps.py) and any straggler still carry absolute Homebrew
+# paths.  Any dep whose basename already exists in lib/ can safely become a
+# bare name resolved at runtime via DYLD_FALLBACK_LIBRARY_PATH.
+	python3 ./scripts/fixup_bundle_deps.py "$(root)"
+
+# Build-time guard: fail the build if any bundled Mach-O still references
+# /opt/homebrew.  Duplicate-library bugs are silent at bundle time and
+# catastrophic at runtime; catching them here is cheap.
+	bash scripts/verify_no_homebrew_refs.sh "$(root)"
+
+# cleanup and strip libraries
+	find "$(lib)" -name '*.dylib' -exec strip -S - {} \; 2>/dev/null || true
+	find "$(lib)" -name '*.py[co]' -delete 2>/dev/null || true
+	find "$(lib)" -name '*.la' -delete 2>/dev/null || true
 
 # share dir
-	mkdir -p $(share)/themes
-	cp -r $(GTK_PREFIX)/share/themes/* $(share)/themes/
-	mkdir -p $(share)/locale
-	-cp -r $(GTK_PREFIX)/share/locale/* $(share)/locale/
-	mkdir -p $(share)/icons
-	-cp -r $(GTK_PREFIX)/share/icons/* $(share)/icons/
-	mkdir -p $(share)/glib-2.0
-	-cp -r $(GTK_PREFIX)/share/glib-2.0/schemas $(share)/glib-2.0
+	mkdir -p "$(share)/themes"
+	-cp -r $(GTK_PREFIX)/share/themes/* "$(share)/themes/"
+	mkdir -p "$(share)/locale"
+	-cp -r $(GTK_PREFIX)/share/locale/* "$(share)/locale/"
+	mkdir -p "$(share)/icons"
+	-cp -r $(GTK_PREFIX)/share/icons/* "$(share)/icons/"
+# Copy the Adwaita icon theme directly from the Cellar — /opt/homebrew/share/
+# icons/Adwaita/ exists but is missing the binary icon-theme.cache that GTK
+# needs for efficient icon lookup.  Without the cache, GTK's theme lookup
+# fails with "Icon not present in theme" even when the SVG is on disk.
+	@ADWAITA=$$(ls -d $(HOMEBREW_PREFIX)/Cellar/adwaita-icon-theme/*/share/icons/Adwaita 2>/dev/null | head -1); \
+	if [ -n "$$ADWAITA" ]; then \
+	  echo "Copying Adwaita from $$ADWAITA"; \
+	  rm -rf "$(share)/icons/Adwaita"; \
+	  cp -rL "$$ADWAITA" "$(share)/icons/"; \
+	else \
+	  echo "Warning: adwaita-icon-theme not installed (brew install adwaita-icon-theme)"; \
+	fi
+	mkdir -p "$(share)/glib-2.0"
+	-cp -r $(GTK_PREFIX)/share/glib-2.0/schemas "$(share)/glib-2.0"
 
-# Now that the app has been created, let's package it
-# The gps.app package
-	pkgbuild --root _build/Applications \
-	         --version $(GPS_VERSION_NUM) \
-	         --identifier com.adacore.gps \
-	         _build/gps.pkg
+# Codesign pass.  macOS 26+ dyld enforces code signatures at page-load time
+# even for ad-hoc (linker-signed) binaries, so install_name_tool modifications
+# must be followed by a re-sign.  With a real identity, use --options runtime
+# for notarization compatibility.  Without one, apply ad-hoc (-s -) to every
+# dylib and executable so macOS accepts the modified load commands.
+	@if [ -n "$$CODESIGN_IDENTITY" ]; then \
+	  echo "Signing bundle with identity '$$CODESIGN_IDENTITY'"; \
+	  codesign --force --deep --options runtime \
+	    --entitlements "$(TOP)/srcs/entitlements.plist" \
+	    -s "$$CODESIGN_IDENTITY" \
+	    "$(TOP)/_build/Applications/$(APP)"; \
+	else \
+	  echo "Applying ad-hoc signatures + entitlements (macOS 26 hardened runtime)"; \
+	  find "$(lib)" -name '*.dylib' -o -name '*.so' | \
+	    xargs -I{} codesign --force --entitlements "$(TOP)/srcs/entitlements.plist" -s - {} 2>/dev/null || true; \
+	  find "$(bin)" -type f | \
+	    xargs -I{} codesign --force --entitlements "$(TOP)/srcs/entitlements.plist" -s - {} 2>/dev/null || true; \
+	fi
 
-# The command line handling package
-	mkdir -p _build/bin
-	cp srcs/gps_command_line _build/bin/gps
-	chmod a+x _build/bin/gps
-	pkgbuild --root _build/bin \
-	         --version $(GPS_VERSION_NUM) \
-	         --identifier com.adacore.gpscmdlin \
-	         _build/gpscmdlin.pkg
+	@touch _build/Applications/.staged
 
-# The end product, allowing custom install
-	mkdir -p _build/resources
-	cp srcs/background.png _build/resources/background.png
-	productbuild --distribution srcs/gps.dist \
-	             --resources _build/resources \
-	             --package-path _build \
-	             $(PREFIX)/$(PKG)
-	rm -rf _build
-
+# Convenience: symlink the in-bundle gps_wrapper onto PATH.
+# Expects the .app to already live in /Applications.
+install-cli:
+	mkdir -p "$(DESTDIR)$(CLI_PREFIX)/bin"
+	ln -sf "/Applications/$(APP)/Contents/MacOS/bin/gnatstudio" \
+	       "$(DESTDIR)$(CLI_PREFIX)/bin/gnatstudio"
+	@echo "Installed: $(DESTDIR)$(CLI_PREFIX)/bin/gnatstudio"

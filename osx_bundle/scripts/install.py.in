@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 """Tool used to find and copy the library dependencies of executable into a bundle.
 
@@ -18,25 +18,29 @@ import stat
 from resolver import Resolver
 
 if len(sys.argv) < 3:
-    print "Usage:"
-    print "  %s prefix files ... " % os.path.basename(sys.argv[0])
+    print("Usage:")
+    print("  %s prefix files ... " % os.path.basename(sys.argv[0]))
+    sys.exit(1)
 
-prefix=sys.argv[1]
+prefix = sys.argv[1]
 
 if not os.path.isdir(prefix):
-    print "%s is not a directory" % prefix
+    print("%s is not a directory" % prefix)
+    sys.exit(1)
 
+import subprocess as _sp
+_brew_prefix = _sp.check_output(["brew", "--prefix"], text=True).strip()
 resolver = Resolver(prefix, sys.argv[2:],
-                    ["@EXEC_PREFIX@", "@GTKADA_PREFIX@", "@GTK_PREFIX@"])
+                    [p for p in ["@GTK_PREFIX@", _brew_prefix] if p and p not in ("NONE", "")])
 
-for libname in resolver.to_copy.keys():
+for libname in list(resolver.to_copy.keys()):
     lib = resolver.to_copy[libname]
 
     if len(lib[0]) > 0:
-        print "Copying %s as %s" % lib
+        print("Copying %s as %s" % lib)
         dirname = os.path.dirname(lib[1])
         if not os.path.isdir(dirname):
-            os.mkdir(dirname)
+            os.makedirs(dirname, exist_ok=True)
 
         shutil.copy(lib[0], lib[1])
         st = os.stat(lib[1])

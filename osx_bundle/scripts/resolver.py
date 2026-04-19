@@ -64,7 +64,16 @@ class Resolver(object):
         return False
 
     def to_bundle(self, filename, prefix):
-        """Returns the bundle's filename for library filename"""
+        """Returns the bundle's filename for library filename.
+
+        Dylibs are placed flat in <prefix>/lib/ regardless of their source
+        directory structure.  This ensures DYLD_FALLBACK_LIBRARY_PATH
+        ($root/lib) can locate them at runtime.  Other files (executables,
+        data) preserve their path relative to the source prefix.
+        """
+        basename = os.path.basename(filename)
+        if ".dylib" in basename:
+            return os.path.join(self.prefix, "lib", basename)
         return filename.replace(prefix, self.prefix)
 
     def _get_deps(self, filename):

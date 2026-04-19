@@ -1,3 +1,6 @@
+# local toolchain + build artifacts (see bootstrap/Makefile)
+/.tools/
+
 # submodules
 /ada_language_server
 /laltools

@@ -14,8 +14,15 @@ fi
 
 # Get absolute directory and strip 'bin' directory to retrieve real root
 root="$(cd "$root/.."; pwd)"
-pixbuf_base="$root/lib/gnatstudio/gdk-pixbuf-2.0/2.10.0/"
-immodules_base="$root/lib/gnatstudio/gtk-3.0/3.0.0/"
+# Detect layout: macOS bundles put GTK files flat under lib/ ; older packages
+# nested them under lib/gnatstudio/.  Pick the one that exists.
+if [ -d "$root/lib/gnatstudio/gdk-pixbuf-2.0" ]; then
+    pixbuf_base="$root/lib/gnatstudio/gdk-pixbuf-2.0/2.10.0/"
+    immodules_base="$root/lib/gnatstudio/gtk-3.0/3.0.0/"
+else
+    pixbuf_base="$root/lib/gdk-pixbuf-2.0/2.10.0/"
+    immodules_base="$root/lib/gtk-3.0/3.0.0/"
+fi
 
 #
 # For each arg - save old value as GPS_STARTUP_arg, then export new value
@@ -111,15 +118,51 @@ save_and_export GSETTINGS_BACKEND
 
 save_and_export DBUS_SESSION_BUS_ADDRESS
 
-if [[ -v APPIMAGE ]] ; then
-   # When run under AppImage, copy cache files to a temporary dir
-   # and regenerate them to match new $root
-   cache="$(mktemp -d)"
-   cp $pixbuf_base/loaders.cache $cache
-   export GDK_PIXBUF_MODULE_FILE=$cache/loaders.cache
-   export GTK_IM_MODULE_FILE=$cache/immodules.cache
-   $root/bin/gdk-pixbuf-query-loaders --update-cache
-   $root/bin/gtk-query-immodules-3.0 --update-cache
+# Point the embedded interpreter at the bundled Python stdlib. Without this,
+# Python consults compile-time defaults (from Homebrew's Python.framework)
+# and fails with "ModuleNotFoundError: No module named 'encodings'" because
+# the Homebrew install tree isn't present on the user's machine.  Python
+# embedded via Python.framework ignores PYTHONHOME in a few code paths, so
+# also set PYTHONPATH explicitly as a safety net.
+for pyver in 3.14 3.13 3.12 3.11 3.10; do
+    if [ -d "$root/lib/python$pyver" ]; then
+        export PYTHONHOME="$root"
+        export PYTHONPATH="$root/lib/python$pyver:$root/lib/python$pyver/lib-dynload:$root/lib/python$pyver/site-packages"
+        # GPS reads GNATSTUDIO_PYTHONHOME in gps-python_core.adb and passes it
+        # to Register_Python_Scripting → PyConfig.home.  Setting this here
+        # overrides the hardcoded "share/gnatstudio/python" fallback so
+        # sys.prefix resolves to a real directory matching our stdlib layout.
+        export GNATSTUDIO_PYTHONHOME="$root"
+        break
+    fi
+done
+
+# Regenerate gdk-pixbuf and gtk immodule caches to match the *current* bundle
+# location.  Both caches are text files full of absolute module paths baked in
+# at build time; if the user moves or installs the bundle elsewhere (drag to
+# /Applications, AppImage mount, etc.), the old paths become dangling.  We put
+# the freshly-generated caches in a temp dir and point the loader env vars at
+# them.  A tempdir is required because $root itself may be read-only (e.g.
+# mounted from a dmg or in /Applications with SIP-hardened parents).
+if [ -x "$root/bin/gtk-query-immodules-3.0" ] \
+   || [ -x "$root/bin/gdk-pixbuf-query-loaders" ]; then
+    cache="$(mktemp -d)"
+    if [ -x "$root/bin/gdk-pixbuf-query-loaders" ]; then
+        export GDK_PIXBUF_MODULE_FILE="$cache/loaders.cache"
+        "$root/bin/gdk-pixbuf-query-loaders" > "$GDK_PIXBUF_MODULE_FILE" 2>/dev/null || true
+    fi
+    if [ -x "$root/bin/gtk-query-immodules-3.0" ]; then
+        export GTK_IM_MODULE_FILE="$cache/immodules.cache"
+        "$root/bin/gtk-query-immodules-3.0" > "$GTK_IM_MODULE_FILE" 2>/dev/null || true
+    fi
+fi
+
+# If a bundled Ada toolchain lives inside the bundle (copied there at dmg
+# build time), add it to PATH so GNAT Studio can find gnat/gprbuild for
+# on-the-fly compilation without requiring a system-wide toolchain install.
+if [ -d "$root/tools/bin" ]; then
+    PATH=$root/tools/bin:$PATH
+    export PATH
 fi
 
 if [ "$debug" = debug ]; then

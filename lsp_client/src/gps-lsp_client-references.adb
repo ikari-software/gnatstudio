@@ -256,8 +256,8 @@ package body GPS.LSP_Client.References is
       Command : Command_Access;
       Result  : out Command_Return_Type);
 
-   Extended_Projects_Idx : constant Integer := 2;
-   Current_Project_Idx   : constant Integer := 3;
+   --  Extended_Projects_Idx and Current_Project_Idx were used for
+   --  Location.hidden-based category selection (removed in ALS 26.0.0).
 
    -----------------------
    -- All_Refs_Category --
@@ -702,8 +702,9 @@ package body GPS.LSP_Client.References is
             Visible => False);
       end if;
 
-      Has_Hidden := (for some Element of Result =>
-                       Element.hidden.Is_Set and then Element.hidden.Value);
+      Has_Hidden := False;
+      --  ALS 26.0.0 removed the 'hidden' field from Location; no location
+      --  is ever hidden in this version.
 
       Command_Data :=
         (File_To_Locations    => File_To_Location_Maps.Empty_Map,
@@ -1133,19 +1134,9 @@ package body GPS.LSP_Client.References is
                         begin
                            Data.References_Displayed := True;
 
-                           if Loc.hidden.Is_Set
-                             and then Loc.hidden.Value
-                           then
-                              Category := Data.Titles.Element
-                                (Extended_Projects_Idx);
-
-                           elsif Data.Has_Hidden then
-                              Category := Data.Titles.Element
-                                (Current_Project_Idx);
-
-                           else
-                              Category := Data.Titles.First_Element;
-                           end if;
+                           --  ALS 26.0.0: Location.hidden field removed;
+                           --  all results go to the default category.
+                           Category := Data.Titles.First_Element;
 
                            Message :=
                              GPS.Kernel.Messages.Markup.Create_Markup_Message
@@ -1160,9 +1151,7 @@ package body GPS.LSP_Client.References is
                                     (Kinds) & Msg_Text,
                                 Importance               => Unspecified,
                                 Flags                    => Message_Flag,
-                                Allow_Auto_Jump_To_First =>
-                                   not Loc.hidden.Is_Set
-                                     or else not Loc.hidden.Value);
+                                Allow_Auto_Jump_To_First => True);
 
                            GPS.Kernel.Messages.Set_Highlighting
                              (Self   => Message,
@@ -1200,10 +1189,7 @@ package body GPS.LSP_Client.References is
                if View /= null then
                   GPS.Location_View.Expand_Category
                     (Self       => View,
-                     Category   =>
-                       (if Data.Has_Hidden
-                        then Data.Titles.Element (Current_Project_Idx)
-                        else Data.Titles.First_Element),
+                     Category   => Data.Titles.First_Element,
                      Goto_First => True);
                end if;
             end;

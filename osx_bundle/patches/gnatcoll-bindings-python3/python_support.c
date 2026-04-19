@@ -1,0 +1,1006 @@
+/*----------------------------------------------------------------------------
+--                          G N A T C O L L                                 --
+--                                                                          --
+--                     Copyright (C) 2003-2022, AdaCore                     --
+--                                                                          --
+-- This is free software;  you can redistribute it  and/or modify it  under --
+-- terms of the  GNU General Public License as published  by the Free Soft- --
+-- ware  Foundation;  either version 3,  or (at your option) any later ver- --
+-- sion.  This software is distributed in the hope  that it will be useful, --
+-- but WITHOUT ANY WARRANTY;  without even the implied warranty of MERCHAN- --
+-- TABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public --
+-- License for  more details.  You should have  received  a copy of the GNU --
+-- General  Public  License  distributed  with  this  software;   see  file --
+-- COPYING3.  If not, go to http://www.gnu.org/licenses for a complete copy --
+-- of the license.                                                          --
+----------------------------------------------------------------------------*/
+
+/* Force a value for the macro. It will only work for gcc, but otherwise
+ * we cannot use the mingwin python with gcc on Windows*/
+#define PY_LONG_LONG long long
+#include <Python.h>
+#include <object.h>
+#include <compile.h>  /* PyCodeObject definition in older versions*/
+#include <frameobject.h> /* PyFrameObject definition */
+#include <string.h>
+
+/* On Windows and if we have HAVE_DECLSPEC_DLL defined remove the
+   __declspec(dllexport) attribute from PyMODINIT_FUNC. Having such attribute
+   to flag symbols to export from a DLL means that *only* those symbols
+   are exported. */
+#if _WIN32
+#ifdef HAVE_DECLSPEC_DLL
+#undef PyMODINIT_FUNC
+#define PyMODINIT_FUNC PyObject*
+#endif
+#endif
+
+#undef DEBUG
+/* #define DEBUG */
+
+#ifndef PyDescr_TYPE
+#define PyDescr_TYPE(x) (((PyDescrObject *)(x))->d_type)
+#define PyDescr_NAME(x) (((PyDescrObject *)(x))->d_name)
+#endif
+
+/*****************************************************************************
+ * Modern initialization (PEP 587, Python 3.8+)
+ *
+ * Py_SetPythonHome / Py_SetProgramName / Py_InitializeEx are deprecated since
+ * Python 3.11 and on 3.14 they silently leave parts of the interpreter state
+ * uninitialized, which surfaces much later as garbage-pointer crashes inside
+ * type_new().  Use PyConfig + Py_InitializeFromConfig instead.
+ *****************************************************************************/
+
+int
+ada_py_init_from_config (const char *home,
+                         const char *program_name,
+                         int install_signal_handlers)
+{
+   PyStatus status;
+   PyConfig config;
+
+   PyConfig_InitPythonConfig (&config);
+   config.install_signal_handlers = install_signal_handlers;
+
+   if (program_name != NULL && *program_name != '\0') {
+      status = PyConfig_SetBytesString
+        (&config, &config.program_name, program_name);
+      if (PyStatus_Exception (status)) { goto fail; }
+   }
+
+   if (home != NULL && *home != '\0') {
+      status = PyConfig_SetBytesString (&config, &config.home, home);
+      if (PyStatus_Exception (status)) { goto fail; }
+   }
+
+   status = Py_InitializeFromConfig (&config);
+   if (PyStatus_Exception (status)) { goto fail; }
+
+   PyConfig_Clear (&config);
+   return 0;
+
+fail:
+   fprintf (stderr, "Python init failed: %s\n",
+            status.err_msg != NULL ? status.err_msg : "(unknown)");
+   PyConfig_Clear (&config);
+   if (PyStatus_IsExit (status)) { return status.exitcode; }
+   return -1;
+}
+
+/*****************************************************************************
+ * Modules
+ *****************************************************************************/
+
+PyMODINIT_FUNC
+ada_Py_InitModule4
+  (char *name, PyMethodDef *methods,
+   char *doc, PyObject *self)
+{
+   struct PyModuleDef def = {
+     PyModuleDef_HEAD_INIT,
+     name,                /* m_name */
+     doc,                 /* m_doc */
+     -1,                  /* m_size */
+     methods,             /* m_methods */
+     NULL,                /* m_reload */
+     NULL,                /* m_traverse */
+     NULL,                /* m_clear */
+     NULL};               /* m_free */
+   struct PyModuleDef* module = (struct PyModuleDef*)
+         malloc(sizeof(struct PyModuleDef));
+   PyObject* mod;
+
+   memcpy(module, &def, sizeof(struct PyModuleDef));
+   mod = PyModule_Create(module);
+
+   return mod;
+}
+
+// The definition of the module the user is creating via GNATCOLL.
+// There is a single such module, so it is simpler to declare the
+// variable as static rather than use calls to malloc().
+static PyMethodDef user_methods[] = {
+   {NULL, NULL}  /* Sentinel */
+};
+static struct PyModuleDef user_module = {
+     PyModuleDef_HEAD_INIT,
+     NULL,                /* m_name */
+     NULL,                /* m_doc */
+     -1,                  /* m_size */
+     user_methods,        /* m_methods */
+     NULL,                /* m_reload */
+     NULL,                /* m_traverse */
+     NULL,                /* m_clear */
+     NULL                 /* m_free */
+};
+
+static char* user_module_name;
+
+PyMODINIT_FUNC
+init_user_module(void) {
+   //struct PyModuleDef* module = (struct PyModuleDef*)malloc(sizeof(def));
+   //memcpy(module, &def, sizeof(struct PyModuleDef));
+   return PyModule_Create(&user_module);
+};
+
+//  To hide the output, we also need to rewrite displayhook.
+//  Otherwise, calling a python function from Ada will print its
+//  output to stdout (even though we have redirected sys.stdout ?)
+//  So we make sure that nothing is ever printed. We cannot do this
+//  systematically though, since in interactive mode (consoles...)
+//  we still want the usual python behavior.
+
+/* Home + executable paths stashed by the Ada bindings; applied in
+ * ada_py_initialize_and_module via PyConfig.  NULL or empty means "let Python
+ * use its compile-time default".  Owned allocations (strdup'd). */
+static char* ada_py_stashed_home = NULL;
+static char* ada_py_stashed_executable = NULL;
+
+void
+ada_py_set_python_home (const char *home)
+{
+   free (ada_py_stashed_home);
+   ada_py_stashed_home = (home != NULL && *home != '\0') ? strdup (home) : NULL;
+}
+
+/* Stash the absolute path to the embedding binary (e.g. gnatstudio_exe).
+ * Python uses PyConfig.executable to populate sys.executable and as a
+ * starting point for some resource lookups in C extensions — if unset,
+ * embedded Python falls back to "python3" relative lookup which on macOS
+ * often resolves to the wrong interpreter under /usr/bin/ and breaks
+ * subprocess.Popen([sys.executable, ...]). */
+void
+ada_py_set_executable (const char *exe)
+{
+   free (ada_py_stashed_executable);
+   ada_py_stashed_executable = (exe != NULL && *exe != '\0') ? strdup (exe) : NULL;
+}
+
+PyObject*
+ada_py_initialize_and_module(char* program_name, char* name) {
+   PyObject* imported;
+   PyStatus status;
+   PyPreConfig preconfig;
+   PyConfig config;
+
+   user_module_name = strdup(name);
+   user_module.m_name = user_module_name;
+
+   /* Pre-init: enable UTF-8 mode before memory allocator/encoding is locked. */
+   PyPreConfig_InitPythonConfig (&preconfig);
+   preconfig.utf8_mode = 1;
+   status = Py_PreInitialize (&preconfig);
+   if (PyStatus_Exception (status)) {
+      Py_ExitStatusException (status);
+   }
+
+   /* Register our Ada-implemented module BEFORE Py_InitializeFromConfig
+    * so the interpreter sees it during module-table construction. */
+   PyImport_AppendInittab (user_module_name, init_user_module);
+
+   /* Modern init path (PEP 587, required for correct behavior on 3.14+).
+    * Py_SetProgramName / Py_SetPythonHome / Py_InitializeEx are deprecated
+    * since 3.11 and on 3.14 they skip parts of interpreter setup that are
+    * required for type_new()/PyType_Ready to work correctly — calls into
+    * type() later crash with a garbage pointer inside PyDict_GetItemWithError. */
+   PyConfig_InitPythonConfig (&config);
+   config.install_signal_handlers = 0;
+
+   if (program_name != NULL && *program_name != '\0') {
+      status = PyConfig_SetBytesString
+        (&config, &config.program_name, program_name);
+      if (PyStatus_Exception (status)) {
+         PyConfig_Clear (&config);
+         Py_ExitStatusException (status);
+      }
+   }
+
+   /* Explicit PyConfig.executable means sys.executable resolves to our
+    * embedder binary rather than drifting to /usr/bin/python3.  Also prevents
+    * Python's path-computation from walking up from argv[0] and discovering a
+    * second Python install. */
+   if (ada_py_stashed_executable != NULL) {
+      status = PyConfig_SetBytesString
+        (&config, &config.executable, ada_py_stashed_executable);
+      if (PyStatus_Exception (status)) {
+         PyConfig_Clear (&config);
+         Py_ExitStatusException (status);
+      }
+   }
+
+   if (ada_py_stashed_home != NULL) {
+      status = PyConfig_SetBytesString
+        (&config, &config.home, ada_py_stashed_home);
+      if (PyStatus_Exception (status)) {
+         PyConfig_Clear (&config);
+         Py_ExitStatusException (status);
+      }
+   }
+
+   status = Py_InitializeFromConfig (&config);
+   PyConfig_Clear (&config);
+   if (PyStatus_Exception (status)) {
+      Py_ExitStatusException (status);
+   }
+
+   // Initialize the prompt if needed
+
+   PyObject* prompt = PySys_GetObject ("ps1");
+   if (prompt == NULL) {
+      prompt = PyUnicode_FromString (">>> ");
+      PySys_SetObject ("ps1", prompt);
+      Py_DECREF (prompt);
+   }
+
+   prompt = PySys_GetObject ("ps2");
+   if (prompt == NULL) {
+      prompt = PyUnicode_FromString ("... ");
+      PySys_SetObject ("ps2", prompt);
+      Py_DECREF (prompt);
+   }
+
+   // Make the user's module visible to scripts. We cannot use
+   // PyImport_ImportModule, which imports the module but doesn't add
+   // it to the global dictionary and as such it is not visible to
+   // user scripts.
+
+   imported = PyImport_ImportModule(name);
+   if (imported == NULL) {
+      printf ("Could not import module %s", name);
+      return NULL;
+   }
+
+   // Import 'sys', which is needed for instance in Set_Default_Console
+   // to get access to the default value
+   PyRun_SimpleString("import sys\n");
+
+   char* command = (char*)malloc(9 + strlen(name));
+   strcpy (command, "import ");
+   strcat (command, name);
+   strcat (command, "\n");
+   PyRun_SimpleString(command);
+   free (command);
+
+   return imported;
+};
+
+/************************************************************************
+ * Methods
+ * To implement methods, we have the following requirements:
+ *    - we need to support the notion of bound methods in python (where self
+ *      is set automatically by python to the instance that calls the method).
+ *    - we need to pass data back to Ada, that was set when the method was
+ *      declared. This data describes how the method is implemented in Ada.
+ * The implementation is based on Python descriptors. However, none of the
+ * predefined descriptors provides support for passing data back to Ada.
+ * So we define our own descriptor, heavily based on the predefined one.
+ *
+ * From python, when you do a.foo(), the following occurs behind the scene:
+ *   - retrieves "A.foo", as a PyAdaMethodDescrObject
+ *   - since this is a descriptor, calls  .__get__() to get the function
+ *     to execute. In practice, this calls adamethod_descr_get which
+ *     creates a bound method through PyMethod_New (bound to 'a')
+ *   - call that object. The implementation of classobject.c::method_call
+ *     adds self, ie 'a', as the first argument in the tuple of arguments,
+ *     then executes the wrapped function. Here, the wrapped function is
+ *     a PyCFunction that was created when the method was registered
+ *     initially, and that always calls back Ada but always passes the
+ *     same 'self' argument (the data Ada itself provided).
+ ************************************************************************/
+
+typedef struct {
+  PyDescr_COMMON;
+  PyObject *cfunc; // An instance of PyCFunction, bound with the
+                   // data that Ada needs, in the form of a PyCapsule
+  PyMethodDef *def;
+} PyAdaMethodDescrObject;
+
+static PyObject *adamethod_descr_call(PyAdaMethodDescrObject *descr,
+                                      PyObject *arg, PyObject *kw) {
+    return PyObject_Call((PyObject *)descr->cfunc, arg, kw);;
+}
+
+// Implementation of the __get__ descriptor method. The code is heavily
+// copied from descrobject.c::method_get.
+
+static PyObject * adamethod_descr_get
+   (PyAdaMethodDescrObject *descr, PyObject *obj, PyObject *type)
+{
+  PyObject *res;
+  if (obj == NULL) {
+    Py_INCREF(descr);
+    return (PyObject*) descr;
+  }
+  if (!PyObject_TypeCheck(obj, PyDescr_TYPE(descr))) {
+    PyErr_Format(PyExc_TypeError,
+                 "descriptor '%V' for '%s' objects "
+                 "doesn't apply to '%s' object",
+                 PyDescr_NAME(descr), "?",
+                 PyDescr_TYPE(descr)->tp_name,
+                 Py_TYPE(obj)->tp_name);
+    return NULL;
+  }
+  return PyMethod_New (descr->cfunc, obj);
+}
+
+// Implementation of the __getattro__ descriptor method. Manually compute
+// attributes like __name__ and __qualname__ because cfunc/def are hidden
+// inside PyAdaMethodDescrObject.
+
+static PyObject *
+ada_descr_getattro(PyObject *self, PyObject *name)
+{
+  PyAdaMethodDescrObject *descr = (PyAdaMethodDescrObject *)self;
+  PyObject *descr_type = (PyObject *)PyDescr_TYPE(descr);
+
+    if (PyUnicode_Check(name)) {
+
+        if (PyUnicode_CompareWithASCIIString(name, "__name__") == 0) {
+            return PyUnicode_FromString(descr->def->ml_name);
+        }
+
+        if (PyUnicode_CompareWithASCIIString(name, "__qualname__") == 0) {
+            PyObject *type_qn =
+                PyObject_GetAttrString(
+                    descr_type,
+                    "__qualname__");
+
+            if (!type_qn)
+                return NULL;
+
+            PyObject *res = PyUnicode_FromFormat(
+                "%U.%s", type_qn, descr->def->ml_name);
+
+            Py_DECREF(type_qn);
+            return res;
+        }
+
+        if (PyUnicode_CompareWithASCIIString(name, "__objclass__") == 0) {
+            Py_INCREF(descr_type);
+            return descr_type;
+          }
+    }
+
+    return PyObject_GenericGetAttr(self, name);
+}
+
+static PyTypeObject PyAdaMethodDescr_Type = {
+  .ob_base = PyVarObject_HEAD_INIT (NULL, 0).tp_name = "ada_method_descriptor",
+  .tp_basicsize = sizeof (PyAdaMethodDescrObject),
+  .tp_descr_get = (descrgetfunc)adamethod_descr_get,
+  .tp_getattro = ada_descr_getattro,
+  .tp_call = (ternaryfunc)adamethod_descr_call,
+  .tp_flags = Py_TPFLAGS_DEFAULT && !(Py_TPFLAGS_HAVE_VECTORCALL),
+  .tp_vectorcall = NULL,
+  .tp_new = PyType_GenericNew,
+};
+
+// Creates a new AdaMethod instance. 'method' is the description of the Ada
+// function to call, and 'data' is a PyCapsule that is passed to Ada as 'self'.
+
+PyObject *
+PyDescr_NewAdaMethod (PyTypeObject *type, PyMethodDef *def, PyObject *cfunc,
+                      const char *name)
+{
+  PyAdaMethodDescrObject *descr = (PyAdaMethodDescrObject*) PyType_GenericAlloc
+    (&PyAdaMethodDescr_Type, 0);
+
+  if (descr != NULL) {
+    Py_XINCREF(type);
+    PyDescr_TYPE (descr) = type;
+
+    PyDescr_NAME(descr) = PyUnicode_InternFromString(name);
+    if (PyDescr_NAME(descr) == NULL) {
+      Py_DECREF(descr);
+      descr = NULL;
+    }
+  }
+
+  if (descr != NULL) {
+      descr->cfunc = cfunc;
+      descr->def = def;
+  }
+
+  return (PyObject *)descr;
+}
+
+// Adds a new method to the class 'class'.
+// 'module' is the module to which the class belongs, and is used to set
+//    the __module__ attribute of the new method.
+// 'def' described the C function that will be called when the function is
+//    executed in python.
+// 'data' is data to pass from C->Python->C (generally wrapped in a PyCapsule).
+//    It will be pass as the "Self" argument to First_Level.
+
+void ada_py_add_method
+   (PyMethodDef* def, PyObject* data, PyObject* class, PyObject* module)
+{
+  PyObject* cfunc = PyCFunction_NewEx
+    (def, data, PyUnicode_FromString (PyModule_GetName (module)));
+
+  PyObject* method = PyDescr_NewAdaMethod
+    ((PyTypeObject*)class, def, cfunc, def->ml_name);
+
+  PyObject_SetAttrString (class, def->ml_name, method);
+  Py_DECREF (method);
+};
+
+/*****************************************************************************/
+
+int
+ada_pyget_refcount (PyObject* obj)
+{
+   return Py_REFCNT(obj);
+}
+
+char*
+ada_py_refcount_msg (PyObject* obj)
+{
+   static char msg[200];
+   if (obj) {
+      snprintf (msg, 199, "%p (%s, rc=%ld)",
+                obj, Py_TYPE(obj)->tp_name, Py_REFCNT(obj));
+   } else {
+      msg[0] = '\0';
+   }
+   return msg;
+}
+
+void ada_py_print_refcount(PyObject* obj, char* msg) {
+  if (obj)
+    printf ("DEBUG %s %s\n", msg, ada_py_refcount_msg (obj));
+}
+
+void
+ada_py_incref (PyObject* obj)
+{
+  Py_INCREF (obj);
+#ifdef DEBUG
+  ada_py_print_refcount (obj, "after incref");
+#endif
+}
+
+void
+ada_py_decref (PyObject* obj)
+{
+#ifdef DEBUG
+  ada_py_print_refcount (obj, "before decref");
+#endif
+  Py_DECREF (obj);
+}
+
+void
+ada_py_xincref (PyObject* obj)
+{
+  Py_XINCREF (obj);
+#ifdef DEBUG
+  ada_py_print_refcount (obj, "after xincref");
+#endif
+}
+
+void
+ada_py_xdecref (PyObject* obj)
+{
+#ifdef DEBUG
+  ada_py_print_refcount (obj, "before xdecref");
+#endif
+  Py_XDECREF (obj);
+}
+
+PyTypeObject*
+__gnatcoll_py_type(PyObject *obj)
+{
+  return (PyTypeObject*) (Py_TYPE (obj));
+}
+
+int
+ada_pybasestring_check (PyObject* obj)
+{
+  return PyUnicode_Check (obj);
+}
+
+int
+ada_pystring_check (PyObject* obj)
+{
+  return PyUnicode_Check (obj);
+}
+
+PyObject* ada_PyUnicode_AsEncodedString
+  (PyObject *unicode, const char *encoding, const char *errors)
+{
+  //  A macro in python2.
+  return PyUnicode_AsEncodedString (unicode, encoding, errors);
+}
+
+PyObject* ada_PyUnicode_FromString (const char *u)
+{
+  //  A macro in python2.
+  return PyUnicode_FromString (u);
+}
+
+int
+ada_pyunicode_check (PyObject* obj)
+{
+  return PyUnicode_Check (obj);
+}
+
+int
+ada_pyint_check (PyObject* obj)
+{
+  //  Not available anymore.
+  return PyLong_Check (obj);
+}
+
+//  May be a macro.
+PyAPI_FUNC(int) ada_pylong_check (PyObject* obj) {
+  return PyLong_Check (obj);
+}
+
+int
+ada_pyfloat_check (PyObject* obj)
+{
+  return PyFloat_Check (obj);
+}
+
+int
+ada_pybool_check (PyObject* obj)
+{
+#ifdef PyBool_Check
+  return PyBool_Check (obj);
+#else
+  return 0;
+#endif
+}
+
+int
+ada_pybool_is_true (PyObject* obj)
+{
+  return PyObject_IsTrue (obj);
+}
+
+int
+ada_pydict_check (PyObject* obj)
+{
+  return PyDict_Check (obj);
+}
+
+int
+ada_pyanyset_check (PyObject* obj)
+{
+  return PyAnySet_Check (obj);
+}
+
+int
+ada_pyfunction_check (PyObject* obj)
+{
+  return PyFunction_Check (obj);
+}
+
+PyObject*
+ada_pyfunction_get_globals (PyObject* obj)
+{
+  return PyFunction_GET_GLOBALS (obj);
+}
+
+PyObject*
+ada_pyfunction_get_code (PyObject* obj)
+{
+  return PyFunction_GET_CODE (obj);
+}
+
+PyObject*
+ada_pyfunction_get_closure (PyObject* obj)
+{
+  return PyFunction_GET_CLOSURE (obj);
+}
+
+PyObject*
+ada_pyfunction_get_defaults (PyObject* obj)
+{
+  return PyFunction_GET_DEFAULTS (obj);
+}
+
+PyObject* ada_PyEval_EvalCodeEx
+  (PyCodeObject *co,
+   PyObject *globals,
+   PyObject *locals,
+   PyObject *args,
+   PyObject *kwds,
+   PyObject *defs,
+   PyObject *closure)
+{
+   /* Code copied from funcobject.c::function_call() */
+
+  PyObject **k, **d;
+  PyObject* result;
+  PyObject* kwtuple;
+  int nk, nd;
+
+  if (defs != NULL && PyTuple_Check(defs)) {
+     d = &PyTuple_GET_ITEM((PyTupleObject *)defs, 0);
+     nd = PyTuple_Size(defs);
+  } else {
+     d = NULL;
+     nd = 0;
+  }
+
+  if (kwds != NULL && PyDict_Check(kwds)) {
+     int i = 0;
+     Py_ssize_t pos = 0;
+
+     nk = PyDict_Size(kwds);
+     kwtuple = PyTuple_New(2*nk);
+     if (kwtuple == NULL)
+       return NULL;
+     k = &PyTuple_GET_ITEM(kwtuple, 0);
+     pos = i = 0;
+     while (PyDict_Next(kwds, &pos, &k[i], &k[i+1])) {
+       Py_INCREF(k[i]);
+       Py_INCREF(k[i+1]);
+       i += 2;
+     }
+     nk = i/2;
+  } else {
+     k = NULL;
+     nk = 0;
+  }
+
+  result = (PyObject*) PyEval_EvalCodeEx
+    ((PyObject*) co,
+     globals, locals,
+     &PyTuple_GET_ITEM (args, 0) /* args */, PyTuple_Size (args) /* argc*/,
+     k /* kwds */, nk /* kwdc */,
+     d /* defs */, nd /* defcount */,
+     NULL, /* kwdefs */
+     closure /* closure */);
+
+  Py_XDECREF (kwtuple);
+  return result;
+}
+
+int
+ada_pycobject_check (PyObject* obj)
+{
+  return PyCapsule_CheckExact (obj);
+}
+
+int
+ada_pytuple_check (PyObject* obj)
+{
+  return PyTuple_Check (obj);
+}
+
+int
+ada_pylist_check (PyObject* obj)
+{
+  return PyList_Check (obj);
+}
+
+int
+ada_pyiter_check (PyObject* obj)
+{
+  return PyIter_Check (obj);
+}
+
+int
+ada_pymethod_check (PyObject* obj)
+{
+  return PyMethod_Check (obj);
+}
+
+char*
+ada_tp_name (PyTypeObject* obj)
+{
+  return (char *)obj->tp_name;
+}
+
+PyObject* ada_py_none ()
+{
+  return Py_None;
+}
+
+PyObject* ada_py_false()
+{
+  return Py_False;
+}
+
+PyObject*
+ada_py_true()
+{
+  return Py_True;
+}
+
+PyObject *
+ada_py_object_callmethod (PyObject *o, char *m)
+{
+  return PyObject_CallMethod (o, m, "");
+}
+
+PyObject *
+ada_py_object_callmethod_obj (PyObject *o, char *m, PyObject *arg)
+{
+  return PyObject_CallMethod (o, m, "(O)", arg);
+}
+
+PyObject *
+ada_py_object_callmethod_int (PyObject *o, char *m, int arg)
+{
+  return PyObject_CallMethod (o, m, "(i)", arg);
+}
+
+int
+ada_py_arg_parsetuple_ptr (PyObject *o, char *fmt, void *arg1)
+{
+  return PyArg_ParseTuple (o, fmt, arg1);
+}
+
+int
+ada_py_arg_parsetuple_ptr2 (PyObject *o, char *fmt, void *arg1, void *arg2)
+{
+  return PyArg_ParseTuple (o, fmt, arg1, arg2);
+}
+
+int
+ada_py_arg_parsetuple_ptr3
+  (PyObject *o, char *fmt, void *arg1, void * arg2, void *arg3)
+{
+  return PyArg_ParseTuple (o, fmt, arg1, arg2, arg3);
+}
+
+int
+ada_py_arg_parsetuple_ptr4
+  (PyObject *o, char *fmt, void *arg1, void * arg2, void *arg3, void *arg4)
+{
+  return PyArg_ParseTuple (o, fmt, arg1, arg2, arg3, arg4);
+}
+
+int
+ada_py_arg_parsetuple_ptr5
+  (PyObject *o, char *fmt,
+   void *arg1, void * arg2, void *arg3, void *arg4, void *arg5)
+{
+  return PyArg_ParseTuple (o, fmt, arg1, arg2, arg3, arg4, arg5);
+}
+
+extern int gnat_argc;
+extern char **gnat_argv;
+
+int
+__gnatcoll_py_main ()
+{
+  wchar_t *w_gnat_argv[gnat_argc];
+  int result;
+
+  for (int i=0; i<gnat_argc; i++) {
+    w_gnat_argv[i] = Py_DecodeLocale(gnat_argv[i], NULL);
+  }
+
+  result = Py_Main (gnat_argc, w_gnat_argv);
+
+  for (int i=0; i<gnat_argc; i++) {
+    PyMem_RawFree((void *) w_gnat_argv[i]);
+  }
+
+  return result;
+}
+
+PyObject*
+ada_type_new (PyTypeObject* meta, char* name, PyObject* bases, PyObject* dict)
+{
+  /* Note:  PyTuple_SetItem / PyTuple_SET_ITEM both *steal* references.
+   * The historical comments in this function were wrong.  Since callers
+   * (e.g. Register_Class in gnatcoll-scripts-python.adb) decrement `dict`
+   * and `bases` themselves after the call, we must INCREMENT the refcount
+   * before stealing to keep the caller's ownership intact. */
+
+  PyObject *args, *result;
+  PyObject *name_obj, *bases_obj;
+  PyObject *metatype;
+
+  if (dict == NULL) {
+    PyErr_SetString (PyExc_TypeError,
+                     "ada_type_new requires a non-null dict");
+    return NULL;
+  }
+
+  metatype = (meta == NULL) ? (PyObject *)&PyType_Type : (PyObject *)meta;
+
+  name_obj = PyUnicode_FromString (name);
+  if (name_obj == NULL) { return NULL; }
+
+  if (bases == NULL) {
+    bases_obj = PyTuple_New (0);
+  } else {
+    Py_INCREF (bases);
+    bases_obj = bases;
+  }
+  if (bases_obj == NULL) {
+    Py_DECREF (name_obj);
+    return NULL;
+  }
+
+  /* Build args = (name, bases, dict), stealing our freshly-owned references.
+   * For `dict` we borrow caller's reference and add one so the tuple owns
+   * a ref that gets released when we DECREF the tuple. */
+  Py_INCREF (dict);
+  args = PyTuple_Pack (3, name_obj, bases_obj, dict);
+  Py_DECREF (name_obj);
+  Py_DECREF (bases_obj);
+  Py_DECREF (dict);
+  if (args == NULL) { return NULL; }
+
+  /* Call metatype(args) via the normal object-call path.  Going through
+   * PyObject_Call routes through type.__call__ which on Python 3.14 is
+   * required for correct static-identifier-string setup inside type_new;
+   * calling metatype->tp_new directly bypassed that and crashed on 3.14
+   * with a garbage-pointer read inside PyDict_GetItemWithError. */
+  result = PyObject_Call (metatype, args, NULL);
+  Py_DECREF (args);
+  return result;
+}
+
+int
+ada_pydescr_newGetSet (PyTypeObject* type,
+		       char*         name,
+		       setter        set,
+		       getter        get,
+		       char*         doc,
+		       void*         closure)
+{
+  struct PyGetSetDef *descr =
+     (struct PyGetSetDef*)malloc (sizeof (struct PyGetSetDef));
+  PyObject* prop;
+
+  descr->name    = name;
+  descr->get     = get;
+  descr->set     = set;
+  descr->doc     = doc;
+  descr->closure = closure;
+
+  prop = PyDescr_NewGetSet (type, descr);
+  if (prop == NULL) {
+    return 0;
+  } else {
+    PyDict_SetItemString (type->tp_dict, name, prop);
+    Py_DECREF (prop);
+    return 1;
+  }
+}
+
+PyThreadState* ada_PyGILState_GetThisThreadState() {
+#ifdef WITH_THREAD
+   return PyGILState_GetThisThreadState();
+#else
+   return NULL;
+#endif
+}
+
+int ada_PyGILState_Ensure() {
+  if (Py_IsInitialized ()) {
+#ifdef WITH_THREAD
+    return (int)PyGILState_Ensure();
+#else
+    return 0;
+#endif
+  }
+  return 0;
+}
+
+void ada_PyGILState_Release(PyGILState_STATE state) {
+#ifdef WITH_THREAD
+  if (Py_IsInitialized ()) {
+    PyGILState_Release((PyGILState_STATE)state);
+  }
+#endif
+}
+
+int
+ada_is_subclass (PyObject* class, PyObject* base)
+{
+  if (!class || !base) {
+    return -1;
+  } else {
+    return PyObject_IsSubclass (class, base);
+  }
+}
+
+const char* ada_py_builtin() {
+   return "builtins";
+}
+
+const char* ada_py_builtins() {
+   return "__builtins__";
+}
+
+/* Result value must be freed */
+
+PyAPI_FUNC(const char *) ada_PyString_AsString(PyObject * val) {
+
+   PyObject* utf8 = PyUnicode_AsUTF8String(val);
+   char* tmp = PyBytes_AsString (utf8);
+   char* str = strdup (tmp);
+   Py_XDECREF(utf8);
+   return str;
+
+};
+
+PyAPI_FUNC(PyObject *) PyInt_FromLong(long val) {
+   return PyLong_FromLong(val);
+};
+
+PyAPI_FUNC(PyObject *) PyInt_FromSize_t(size_t val) {
+   return PyLong_FromSize_t(val);
+};
+
+PyAPI_FUNC(long) PyInt_AsLong(PyObject * val) {
+   return PyLong_AsLong(val);
+};
+
+PyAPI_FUNC(PyObject *) PyString_FromStringAndSize(
+      const char *val, Py_ssize_t s)
+{
+   return PyUnicode_FromStringAndSize(val, s);
+};
+
+PyAPI_FUNC(PyObject *) PyFile_FromString
+  (const char *file_name, const char *mode)
+{
+  PyObject * io = PyImport_ImportModule ("io");
+  if (io == NULL) {
+    return NULL;
+  }
+  return PyObject_CallMethod (io, "open", "ss", file_name, mode);
+}
+
+PyCodeObject*
+ada_pyframe_get_code (PyFrameObject* obj)
+{
+#if PY_MAJOR_VERSION > 3 || (PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION > 8)
+   return PyFrame_GetCode(obj);
+#else
+   return obj->f_code;
+#endif
+}
+
+PyFrameObject*
+ada_pyframe_get_back (PyFrameObject* obj)
+{
+#if PY_MAJOR_VERSION > 3 || (PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION > 8)
+   return PyFrame_GetBack(obj);
+#else
+   return obj->f_back;
+#endif
+}
+
+PyObject*
+ada_pycode_get_filename (PyCodeObject* obj)
+{
+   return obj->co_filename;
+}
+
+PyObject*
+ada_pycode_get_name (PyCodeObject* obj)
+{
+   return obj->co_name;
+}

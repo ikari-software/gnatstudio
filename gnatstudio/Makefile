@@ -46,9 +46,11 @@ gps_and_cli: all
 
 include ../Makefile.gnat
 
+GPRBUILD_EXTRA ?=
+
 all: resources generate
 	$(GPRBUILD) $(GPRBUILD_FLAGS) -m -p -ws \
-	  $(GPRBUILD_BUILD_TYPE_FLAGS) -Pgps -largs `pkg-config gmodule-2.0 --libs`
+	  $(GPRBUILD_BUILD_TYPE_FLAGS) $(GPRBUILD_EXTRA) -Pgps -largs `pkg-config gmodule-2.0 --libs`
 
 # Generate some sources
 generate:

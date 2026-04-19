@@ -21,6 +21,7 @@ with VSS.Strings.Conversions;
 
 with Config;                  use Config;
 with GNATCOLL.Arg_Lists;
+with GNATCOLL.Python.Lifecycle;
 with GNATCOLL.Scripts;
 with GNATCOLL.Scripts.Python; use GNATCOLL.Scripts.Python;
 with GNATCOLL.Utils;          use GNATCOLL.Utils;
@@ -35,6 +36,12 @@ package body GPS.Python_Core is
    procedure Register_Python
      (Kernel : access GPS.Core_Kernels.Core_Kernel_Record'Class) is
    begin
+      --  Pin sys.executable to the real host binary.  Without this, embedded
+      --  Python's path computation falls back to argv[0]-walking, which on
+      --  macOS often resolves to /usr/bin/python3 or a nearby Homebrew
+      --  interpreter and breaks subprocess.Popen([sys.executable, ...]).
+      GNATCOLL.Python.Lifecycle.Py_SetExecutable (Executable_Path);
+
       declare
          Python_Home : constant VSS.Strings.Virtual_String :=
            VSS.Application.System_Environment.Value ("GNATSTUDIO_PYTHONHOME");
@@ -42,9 +49,16 @@ package body GPS.Python_Core is
       begin
          if Python_Home.Is_Empty then
             declare
+               --  PyConfig.home determines sys.prefix, which Python uses to
+               --  locate its stdlib at $home/lib/pythonX.Y/.  The bundle lays
+               --  stdlib out at $(Executable_Location)/lib/pythonX.Y/, so
+               --  PyConfig.home must be Executable_Location itself — NOT
+               --  Executable_Location/share/gnatstudio/python (which doesn't
+               --  exist in the bundle and caused sys.prefix to resolve to a
+               --  phantom directory, silently breaking module-path lookups
+               --  in C extensions that compute paths off sys.prefix).
                Packaged_Python_Location : constant Virtual_File :=
-                 Create (+Executable_Location)
-                 / (+"share") / (+"gnatstudio") / (+"python");
+                 Create (+Executable_Location);
             begin
                Register_Python_Scripting
                  (Kernel.Scripts,

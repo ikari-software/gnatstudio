@@ -64,7 +64,7 @@
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>gps</string>
+	<string>gnatstudio</string>
 	<key>CFBundleIconFile</key>
 	<string>gps.icns</string>
 	<key>CFBundleIdentifier</key>
@@ -72,22 +72,20 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>GPS</string>
+	<string>GNAT Studio</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>5.1.0</string>
+	<string>__GPS_VERSION__</string>
 	<key>CFBundleSignature</key>
 	<string>ADAC</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>LSArchitecturePriority</key>
-	<array>
-		<string>x86_64</string>
-	</array>
 	<key>LSMinimumSystemVersion</key>
-	<string>10.9.0</string>
+	<string>10.13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2001-2011 AdaCore</string>
+	<string>Copyright © 2001-2026 AdaCore</string>
 </dict>
 </plist>
