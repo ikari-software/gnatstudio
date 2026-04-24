@@ -169,6 +169,14 @@ _build/Applications/.staged: force
 #   * The renamed libpixbufloader-svg.so pulls librsvg-2.2 and its deps.
 # gtk-query-immodules-3.0 and gdk-pixbuf-query-loaders are included so they
 # can run from the bundle at startup (gps_wrapper regens the caches).
+# librsvg-2.2.dylib is the runtime target of libpixbufloader-svg.so, but the
+# loader references it as "@rpath/librsvg-2.2.dylib" — resolver.py's prefix
+# filter rejects non-absolute deps, so it would never be copied via transitive
+# walking.  Feed it explicitly so install.py copies it AND walks its own deps
+# (glib/gio/gobject/cairo/pango — most already bundled).  Using the
+# $(HOMEBREW_PREFIX)/lib/ symlink (not the Cellar realpath) so install.py's
+# target-path computation places it flat under $(lib)/librsvg-2.2.dylib;
+# shutil.copy dereferences symlinks at read time so the real file is copied.
 	python3 ./scripts/install.py "$(root)" \
 	  $(HOMEBREW_PREFIX)/bin/gdk-pixbuf-query-loaders \
 	  $(HOMEBREW_PREFIX)/bin/gtk-query-immodules-3.0 \
@@ -180,7 +188,8 @@ _build/Applications/.staged: force
 	  "$(lib)"/$(PYTHON_VER)/lib-dynload/*.so \
 	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/*.so \
 	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/overrides/*.so \
-	  $(HOMEBREW_PREFIX)/lib/libgirepository*.dylib
+	  $(HOMEBREW_PREFIX)/lib/libgirepository*.dylib \
+	  $(HOMEBREW_PREFIX)/lib/librsvg-2.2.dylib
 
 # Final fixup: rewrite ALL remaining absolute-path deps to bare names.
 # install.py only processes files on its command line, so Ada dylibs (from
