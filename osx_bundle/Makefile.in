@@ -130,6 +130,17 @@ _build/Applications/.staged: force
 	cp -RL $(HOMEBREW_PREFIX)/lib/$(PYTHON_VER)/site-packages/gi \
 	       "$(lib)/$(PYTHON_VER)/site-packages/"
 
+# Copy py3cairo (the `cairo` site-package).  PyGObject's _gi_cairo.so calls
+# PyImport_ImportModule("cairo") to bridge GTK cairo contexts to Python; if
+# the bundle lacks py3cairo, Python finds Homebrew's site-packages copy whose
+# _cairo.*.so links /opt/homebrew/opt/cairo/lib/libcairo.2.dylib — that pulls
+# a second libcairo + libpng + libfontconfig + libfreetype + libX11 stack
+# into the process, splitting GtkIconTheme state between two libgtk copies
+# and aborting at ensure_surface_for_gicon ("Icon 'image-missing' not present").
+# Feeding the .so to install.py rewrites its dep to bare libcairo.2.dylib.
+	cp -RL $(HOMEBREW_PREFIX)/lib/$(PYTHON_VER)/site-packages/cairo \
+	       "$(lib)/$(PYTHON_VER)/site-packages/"
+
 # Copy libadalang's Python ctypes binding (single __init__.py that dlopens
 # libadalang.dylib).  Required by GPS plug-ins via "import libadalang".
 # Search order: Alire cache (if live), vendored snapshot in the repo.
@@ -188,6 +199,7 @@ _build/Applications/.staged: force
 	  "$(lib)"/$(PYTHON_VER)/lib-dynload/*.so \
 	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/*.so \
 	  "$(lib)"/$(PYTHON_VER)/site-packages/gi/overrides/*.so \
+	  "$(lib)"/$(PYTHON_VER)/site-packages/cairo/*.so \
 	  $(HOMEBREW_PREFIX)/lib/libgirepository*.dylib \
 	  $(HOMEBREW_PREFIX)/lib/librsvg-2.2.dylib
 
